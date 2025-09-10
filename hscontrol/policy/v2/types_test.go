@@ -349,6 +349,42 @@ func TestUnmarshalPolicy(t *testing.T) {
 			},
 		},
 		{
+			name: "2652-asterix-error-better-explain",
+			input: `
+{
+	"acls": [
+		{
+			"action": "accept",
+			"src": [
+				"*"
+			],
+			"dst": [
+				"*:*"
+			],
+			"proto": [
+				"*:*"
+			]
+		}
+	],
+	"ssh": [
+		{
+			"action": "accept",
+			"src": [
+				"*"
+			],
+			"dst": [
+				"*"
+			],
+			"proto": [
+				"*:*"
+			]
+		}
+	]
+}
+			`,
+			wantErr: "alias v2.Asterix is not supported for SSH source",
+		},
+		{
 			name: "invalid-username",
 			input: `
 {
@@ -412,7 +448,7 @@ func TestUnmarshalPolicy(t *testing.T) {
 `,
 			wantErr: `Hostname "derp" contains an invalid IP address: "10.0/42"`,
 		},
-		// TODO(kradalby): Figure out why this doesnt work.
+		// TODO(kradalby): Figure out why this doesn't work.
 		// 		{
 		// 			name: "invalid-hostname",
 		// 			input: `
@@ -1074,7 +1110,7 @@ func TestResolvePolicy(t *testing.T) {
 					ForcedTags: []string{"tag:anything"},
 					IPv4:       ap("100.100.101.2"),
 				},
-				// not matchin pak tag
+				// not matching pak tag
 				{
 					User: users["testuser"],
 					AuthKey: &types.PreAuthKey{
@@ -1108,7 +1144,7 @@ func TestResolvePolicy(t *testing.T) {
 					ForcedTags: []string{"tag:anything"},
 					IPv4:       ap("100.100.101.5"),
 				},
-				// not matchin pak tag
+				// not matching pak tag
 				{
 					User: users["groupuser"],
 					AuthKey: &types.PreAuthKey{
@@ -1147,7 +1183,7 @@ func TestResolvePolicy(t *testing.T) {
 					ForcedTags: []string{"tag:anything"},
 					IPv4:       ap("100.100.101.10"),
 				},
-				// not matchin pak tag
+				// not matching pak tag
 				{
 					AuthKey: &types.PreAuthKey{
 						Tags: []string{"tag:alsotagged"},
@@ -1159,7 +1195,7 @@ func TestResolvePolicy(t *testing.T) {
 					ForcedTags: []string{"tag:test"},
 					IPv4:       ap("100.100.101.234"),
 				},
-				// not matchin pak tag
+				// not matching pak tag
 				{
 					AuthKey: &types.PreAuthKey{
 						Tags: []string{"tag:test"},

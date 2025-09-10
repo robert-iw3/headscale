@@ -310,6 +310,7 @@ type OIDCUserInfo struct {
 	PreferredUsername string          `json:"preferred_username"`
 	Email             string          `json:"email"`
 	EmailVerified     FlexibleBoolean `json:"email_verified,omitempty"`
+	Groups            []string        `json:"groups"`
 	Picture           string          `json:"picture"`
 }
 
@@ -320,7 +321,7 @@ func (u *User) FromClaim(claims *OIDCClaims) {
 	if err == nil {
 		u.Name = claims.Username
 	} else {
-		log.Debug().Err(err).Msgf("Username %s is not valid", claims.Username)
+		log.Debug().Caller().Err(err).Msgf("Username %s is not valid", claims.Username)
 	}
 
 	if claims.EmailVerified {

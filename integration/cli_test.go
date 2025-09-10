@@ -354,7 +354,11 @@ func TestPreAuthKeyCommand(t *testing.T) {
 			continue
 		}
 
-		assert.Equal(t, []string{"tag:test1", "tag:test2"}, listedPreAuthKeys[index].GetAclTags())
+		assert.Equal(
+			t,
+			[]string{"tag:test1", "tag:test2"},
+			listedPreAuthKeys[index].GetAclTags(),
+		)
 	}
 
 	// Test key expiry
@@ -604,7 +608,7 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		status, err := client.Status()
 		assert.NoError(ct, err)
-		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState, 
+		assert.NotContains(ct, []string{"Starting", "Running"}, status.BackendState,
 			"Expected node to be logged out, backend state: %s", status.BackendState)
 	}, 30*time.Second, 2*time.Second)
 

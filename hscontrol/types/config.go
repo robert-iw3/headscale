@@ -234,6 +234,7 @@ type Tuning struct {
 	NotifierSendTimeout            time.Duration
 	BatchChangeDelay               time.Duration
 	NodeMapSessionBufferedChanSize int
+	BatcherWorkers                 int
 }
 
 func validatePKCEMethod(method string) error {
@@ -296,8 +297,10 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.search_domains", []string{})
 
 	viper.SetDefault("derp.server.enabled", false)
+	viper.SetDefault("derp.server.verify_clients", true)
 	viper.SetDefault("derp.server.stun.enabled", true)
 	viper.SetDefault("derp.server.automatically_add_embedded_derp_region", true)
+	viper.SetDefault("derp.update_frequency", "3h")
 
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
@@ -486,6 +489,7 @@ func derpConfig() DERPConfig {
 		urlAddr, err := url.Parse(urlStr)
 		if err != nil {
 			log.Error().
+				Caller().
 				Str("url", urlStr).
 				Err(err).
 				Msg("Failed to parse url, ignoring...")
@@ -558,6 +562,7 @@ func logConfig() LogConfig {
 		logFormat = TextLogFormat
 	default:
 		log.Error().
+			Caller().
 			Str("func", "GetLogConfig").
 			Msgf("Could not parse log format: %s. Valid choices are 'json' or 'text'", logFormatOpt)
 	}
@@ -991,6 +996,12 @@ func LoadServerConfig() (*Config, error) {
 			NodeMapSessionBufferedChanSize: viper.GetInt(
 				"tuning.node_mapsession_buffered_chan_size",
 			),
+			BatcherWorkers: func() int {
+				if workers := viper.GetInt("tuning.batcher_workers"); workers > 0 {
+					return workers
+				}
+				return DefaultBatcherWorkers()
+			}(),
 		},
 	}, nil
 }

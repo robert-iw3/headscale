@@ -22,7 +22,9 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -30,6 +32,7 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"gopkg.in/yaml.v3"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
 )
@@ -66,6 +69,7 @@ type HeadscaleInContainer struct {
 	// optional config
 	port             int
 	extraPorts       []string
+	debugPort        int
 	caCerts          [][]byte
 	hostPortBindings map[string][]string
 	aclPolicy        *policyv2.Policy
@@ -258,7 +262,9 @@ func WithDERPConfig(derpMap tailcfg.DERPMap) Option {
 func WithTuning(batchTimeout time.Duration, mapSessionChanSize int) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.env["HEADSCALE_TUNING_BATCH_CHANGE_DELAY"] = batchTimeout.String()
-		hsic.env["HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE"] = strconv.Itoa(mapSessionChanSize)
+		hsic.env["HEADSCALE_TUNING_NODE_MAPSESSION_BUFFERED_CHAN_SIZE"] = strconv.Itoa(
+			mapSessionChanSize,
+		)
 	}
 }
 
@@ -266,6 +272,36 @@ func WithTimezone(timezone string) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.env["TZ"] = timezone
 	}
+}
+
+// WithDERPAsIP enables using IP address instead of hostname for DERP server.
+// This is useful for integration tests where DNS resolution may be unreliable.
+func WithDERPAsIP() Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env["HEADSCALE_DEBUG_DERP_USE_IP"] = "1"
+	}
+}
+
+// WithDebugPort sets the debug port for delve debugging.
+func WithDebugPort(port int) Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.debugPort = port
+	}
+}
+
+// buildEntrypoint builds the container entrypoint command based on configuration.
+func (hsic *HeadscaleInContainer) buildEntrypoint() []string {
+	debugCmd := fmt.Sprintf(
+		"/go/bin/dlv --listen=0.0.0.0:%d --headless=true --api-version=2 --accept-multiclient --allow-non-terminal-interactive=true exec /go/bin/headscale --continue -- serve",
+		hsic.debugPort,
+	)
+
+	entrypoint := fmt.Sprintf(
+		"/bin/sleep 3 ; update-ca-certificates ; %s ; /bin/sleep 30",
+		debugCmd,
+	)
+
+	return []string{"/bin/bash", "-c", entrypoint}
 }
 
 // New returns a new HeadscaleInContainer instance.
@@ -281,9 +317,18 @@ func New(
 
 	hostname := "hs-" + hash
 
+	// Get debug port from environment or use default
+	debugPort := 40000
+	if envDebugPort := envknob.String("HEADSCALE_DEBUG_PORT"); envDebugPort != "" {
+		if port, err := strconv.Atoi(envDebugPort); err == nil {
+			debugPort = port
+		}
+	}
+
 	hsic := &HeadscaleInContainer{
-		hostname: hostname,
-		port:     headscaleDefaultPort,
+		hostname:  hostname,
+		port:      headscaleDefaultPort,
+		debugPort: debugPort,
 
 		pool:     pool,
 		networks: networks,
@@ -300,6 +345,7 @@ func New(
 	log.Println("NAME: ", hsic.hostname)
 
 	portProto := fmt.Sprintf("%d/tcp", hsic.port)
+	debugPortProto := fmt.Sprintf("%d/tcp", hsic.debugPort)
 
 	headscaleBuildOptions := &dockertest.BuildOptions{
 		Dockerfile: IntegrationTestDockerFileName,
@@ -364,17 +410,27 @@ func New(
 
 	runOptions := &dockertest.RunOptions{
 		Name:         hsic.hostname,
-		ExposedPorts: append([]string{portProto, "9090/tcp"}, hsic.extraPorts...),
+		ExposedPorts: append([]string{portProto, debugPortProto, "9090/tcp"}, hsic.extraPorts...),
 		Networks:     networks,
 		// Cmd:          []string{"headscale", "serve"},
 		// TODO(kradalby): Get rid of this hack, we currently need to give us some
 		// to inject the headscale configuration further down.
-		Entrypoint: []string{"/bin/bash", "-c", "/bin/sleep 3 ; update-ca-certificates ; headscale serve ; /bin/sleep 30"},
+		Entrypoint: hsic.buildEntrypoint(),
 		Env:        env,
 	}
 
-	if len(hsic.hostPortBindings) > 0 {
+	// Always bind debug port and metrics port to predictable host ports
+	if runOptions.PortBindings == nil {
 		runOptions.PortBindings = map[docker.Port][]docker.PortBinding{}
+	}
+	runOptions.PortBindings[docker.Port(debugPortProto)] = []docker.PortBinding{
+		{HostPort: strconv.Itoa(hsic.debugPort)},
+	}
+	runOptions.PortBindings["9090/tcp"] = []docker.PortBinding{
+		{HostPort: "49090"},
+	}
+
+	if len(hsic.hostPortBindings) > 0 {
 		for port, hostPorts := range hsic.hostPortBindings {
 			runOptions.PortBindings[docker.Port(port)] = []docker.PortBinding{}
 			for _, hostPort := range hostPorts {
@@ -409,6 +465,12 @@ func New(
 	log.Printf("Created %s container\n", hsic.hostname)
 
 	hsic.container = container
+
+	log.Printf(
+		"Debug ports for %s: delve=%s, metrics/pprof=49090\n",
+		hsic.hostname,
+		hsic.GetHostDebugPort(),
+	)
 
 	// Write the CA certificates to the container
 	for i, cert := range hsic.caCerts {
@@ -570,6 +632,26 @@ func extractTarToDirectory(tarData []byte, targetDir string) error {
 	}
 
 	tarReader := tar.NewReader(bytes.NewReader(tarData))
+
+	// Find the top-level directory to strip
+	var topLevelDir string
+	firstPass := tar.NewReader(bytes.NewReader(tarData))
+	for {
+		header, err := firstPass.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar header: %w", err)
+		}
+
+		if header.Typeflag == tar.TypeDir && topLevelDir == "" {
+			topLevelDir = strings.TrimSuffix(header.Name, "/")
+			break
+		}
+	}
+
+	tarReader = tar.NewReader(bytes.NewReader(tarData))
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
@@ -585,7 +667,20 @@ func extractTarToDirectory(tarData []byte, targetDir string) error {
 			continue // Skip potentially dangerous paths
 		}
 
-		targetPath := filepath.Join(targetDir, filepath.Base(cleanName))
+		// Strip the top-level directory
+		if topLevelDir != "" && strings.HasPrefix(cleanName, topLevelDir+"/") {
+			cleanName = strings.TrimPrefix(cleanName, topLevelDir+"/")
+		} else if cleanName == topLevelDir {
+			// Skip the top-level directory itself
+			continue
+		}
+
+		// Skip empty paths after stripping
+		if cleanName == "" {
+			continue
+		}
+
+		targetPath := filepath.Join(targetDir, cleanName)
 
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -594,6 +689,11 @@ func extractTarToDirectory(tarData []byte, targetDir string) error {
 				return fmt.Errorf("failed to create directory %s: %w", targetPath, err)
 			}
 		case tar.TypeReg:
+			// Ensure parent directories exist
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return fmt.Errorf("failed to create parent directories for %s: %w", targetPath, err)
+			}
+
 			// Create file
 			outFile, err := os.Create(targetPath)
 			if err != nil {
@@ -622,7 +722,7 @@ func (t *HeadscaleInContainer) SaveProfile(savePath string) error {
 		return err
 	}
 
-	targetDir := path.Join(savePath, t.hostname+"-pprof")
+	targetDir := path.Join(savePath, "pprof")
 
 	return extractTarToDirectory(tarFile, targetDir)
 }
@@ -633,7 +733,7 @@ func (t *HeadscaleInContainer) SaveMapResponses(savePath string) error {
 		return err
 	}
 
-	targetDir := path.Join(savePath, t.hostname+"-mapresponses")
+	targetDir := path.Join(savePath, "mapresponses")
 
 	return extractTarToDirectory(tarFile, targetDir)
 }
@@ -642,14 +742,6 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 	// If using PostgreSQL, skip database file extraction
 	if t.postgres {
 		return nil
-	}
-
-	// First, let's see what files are actually in /tmp
-	tmpListing, err := t.Execute([]string{"ls", "-la", "/tmp/"})
-	if err != nil {
-		log.Printf("Warning: could not list /tmp directory: %v", err)
-	} else {
-		log.Printf("Contents of /tmp in container %s:\n%s", t.hostname, tmpListing)
 	}
 
 	// Also check for any .sqlite files
@@ -678,12 +770,6 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 		return errors.New("database file exists but has no schema (empty database)")
 	}
 
-	// Show a preview of the schema (first 500 chars)
-	schemaPreview := schemaCheck
-	if len(schemaPreview) > 500 {
-		schemaPreview = schemaPreview[:500] + "..."
-	}
-
 	tarFile, err := t.FetchPath("/tmp/integration_test_db.sqlite3")
 	if err != nil {
 		return fmt.Errorf("failed to fetch database file: %w", err)
@@ -700,7 +786,12 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 			return fmt.Errorf("failed to read tar header: %w", err)
 		}
 
-		log.Printf("Found file in tar: %s (type: %d, size: %d)", header.Name, header.Typeflag, header.Size)
+		log.Printf(
+			"Found file in tar: %s (type: %d, size: %d)",
+			header.Name,
+			header.Typeflag,
+			header.Size,
+		)
 
 		// Extract the first regular file we find
 		if header.Typeflag == tar.TypeReg {
@@ -716,11 +807,20 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 				return fmt.Errorf("failed to copy database file: %w", err)
 			}
 
-			log.Printf("Extracted database file: %s (%d bytes written, header claimed %d bytes)", dbPath, written, header.Size)
+			log.Printf(
+				"Extracted database file: %s (%d bytes written, header claimed %d bytes)",
+				dbPath,
+				written,
+				header.Size,
+			)
 
 			// Check if we actually wrote something
 			if written == 0 {
-				return fmt.Errorf("database file is empty (size: %d, header size: %d)", written, header.Size)
+				return fmt.Errorf(
+					"database file is empty (size: %d, header size: %d)",
+					written,
+					header.Size,
+				)
 			}
 
 			return nil
@@ -759,6 +859,16 @@ func (t *HeadscaleInContainer) GetPort() string {
 	return strconv.Itoa(t.port)
 }
 
+// GetDebugPort returns the debug port as a string.
+func (t *HeadscaleInContainer) GetDebugPort() string {
+	return strconv.Itoa(t.debugPort)
+}
+
+// GetHostDebugPort returns the host port mapped to the debug port.
+func (t *HeadscaleInContainer) GetHostDebugPort() string {
+	return strconv.Itoa(t.debugPort)
+}
+
 // GetHealthEndpoint returns a health endpoint for the HeadscaleInContainer
 // instance.
 func (t *HeadscaleInContainer) GetHealthEndpoint() string {
@@ -767,9 +877,25 @@ func (t *HeadscaleInContainer) GetHealthEndpoint() string {
 
 // GetEndpoint returns the Headscale endpoint for the HeadscaleInContainer.
 func (t *HeadscaleInContainer) GetEndpoint() string {
-	hostEndpoint := fmt.Sprintf("%s:%d",
-		t.GetHostname(),
-		t.port)
+	return t.getEndpoint(false)
+}
+
+// GetIPEndpoint returns the Headscale endpoint using IP address instead of hostname.
+func (t *HeadscaleInContainer) GetIPEndpoint() string {
+	return t.getEndpoint(true)
+}
+
+// getEndpoint returns the Headscale endpoint, optionally using IP address instead of hostname.
+func (t *HeadscaleInContainer) getEndpoint(useIP bool) string {
+	var host string
+	if useIP && len(t.networks) > 0 {
+		// Use IP address from the first network
+		host = t.GetIPInNetwork(t.networks[0])
+	} else {
+		host = t.GetHostname()
+	}
+
+	hostEndpoint := fmt.Sprintf("%s:%d", host, t.port)
 
 	if t.hasTLS() {
 		return "https://" + hostEndpoint
@@ -786,6 +912,11 @@ func (t *HeadscaleInContainer) GetCert() []byte {
 // GetHostname returns the hostname of the HeadscaleInContainer.
 func (t *HeadscaleInContainer) GetHostname() string {
 	return t.hostname
+}
+
+// GetIPInNetwork returns the IP address of the HeadscaleInContainer in the given network.
+func (t *HeadscaleInContainer) GetIPInNetwork(network *dockertest.Network) string {
+	return t.container.GetIPInNetwork(network)
 }
 
 // WaitForRunning blocks until the Headscale instance is ready to
@@ -821,7 +952,15 @@ func (t *HeadscaleInContainer) WaitForRunning() error {
 func (t *HeadscaleInContainer) CreateUser(
 	user string,
 ) (*v1.User, error) {
-	command := []string{"headscale", "users", "create", user, fmt.Sprintf("--email=%s@test.no", user), "--output", "json"}
+	command := []string{
+		"headscale",
+		"users",
+		"create",
+		user,
+		fmt.Sprintf("--email=%s@test.no", user),
+		"--output",
+		"json",
+	}
 
 	result, _, err := dockertestutil.ExecuteCommand(
 		t.container,
@@ -1132,13 +1271,18 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 		[]string{},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute list node command: %w", err)
+		return nil, fmt.Errorf(
+			"failed to execute approve routes command (node %d, routes %v): %w",
+			id,
+			routes,
+			err,
+		)
 	}
 
 	var node *v1.Node
 	err = json.Unmarshal([]byte(result), &node)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal nodes: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal node response: %q, error: %w", result, err)
 	}
 
 	return node, nil
@@ -1167,4 +1311,83 @@ func (t *HeadscaleInContainer) SendInterrupt() error {
 	}
 
 	return nil
+}
+
+func (t *HeadscaleInContainer) GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
+	// Execute curl inside the container to access the debug endpoint locally
+	command := []string{
+		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/mapresponses",
+	}
+
+	result, err := t.Execute(command)
+	if err != nil {
+		return nil, fmt.Errorf("fetching mapresponses from debug endpoint: %w", err)
+	}
+
+	var res map[types.NodeID][]tailcfg.MapResponse
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		return nil, fmt.Errorf("decoding routes response: %w", err)
+	}
+
+	return res, nil
+}
+
+// PrimaryRoutes fetches the primary routes from the debug endpoint.
+func (t *HeadscaleInContainer) PrimaryRoutes() (*routes.DebugRoutes, error) {
+	// Execute curl inside the container to access the debug endpoint locally
+	command := []string{
+		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/routes",
+	}
+
+	result, err := t.Execute(command)
+	if err != nil {
+		return nil, fmt.Errorf("fetching routes from debug endpoint: %w", err)
+	}
+
+	var debugRoutes routes.DebugRoutes
+	if err := json.Unmarshal([]byte(result), &debugRoutes); err != nil {
+		return nil, fmt.Errorf("decoding routes response: %w", err)
+	}
+
+	return &debugRoutes, nil
+}
+
+// DebugBatcher fetches the batcher debug information from the debug endpoint.
+func (t *HeadscaleInContainer) DebugBatcher() (*hscontrol.DebugBatcherInfo, error) {
+	// Execute curl inside the container to access the debug endpoint locally
+	command := []string{
+		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/batcher",
+	}
+
+	result, err := t.Execute(command)
+	if err != nil {
+		return nil, fmt.Errorf("fetching batcher debug info: %w", err)
+	}
+
+	var debugInfo hscontrol.DebugBatcherInfo
+	if err := json.Unmarshal([]byte(result), &debugInfo); err != nil {
+		return nil, fmt.Errorf("decoding batcher debug response: %w", err)
+	}
+
+	return &debugInfo, nil
+}
+
+// DebugNodeStore fetches the NodeStore data from the debug endpoint.
+func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, error) {
+	// Execute curl inside the container to access the debug endpoint locally
+	command := []string{
+		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/nodestore",
+	}
+
+	result, err := t.Execute(command)
+	if err != nil {
+		return nil, fmt.Errorf("fetching nodestore debug info: %w", err)
+	}
+
+	var nodeStore map[types.NodeID]types.Node
+	if err := json.Unmarshal([]byte(result), &nodeStore); err != nil {
+		return nil, fmt.Errorf("decoding nodestore debug response: %w", err)
+	}
+
+	return nodeStore, nil
 }

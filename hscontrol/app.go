@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/mux"
 	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -28,14 +29,15 @@ import (
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/mapper"
-	"github.com/juanfont/headscale/hscontrol/notifier"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	zerolog "github.com/philip-bui/grpc-zerolog"
 	"github.com/pkg/profile"
 	zl "github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sync/errgroup"
@@ -64,6 +66,19 @@ var (
 	)
 )
 
+var (
+	debugDeadlock        = envknob.Bool("HEADSCALE_DEBUG_DEADLOCK")
+	debugDeadlockTimeout = envknob.RegisterDuration("HEADSCALE_DEBUG_DEADLOCK_TIMEOUT")
+)
+
+func init() {
+	deadlock.Opts.Disable = !debugDeadlock
+	if debugDeadlock {
+		deadlock.Opts.DeadlockTimeout = debugDeadlockTimeout()
+		deadlock.Opts.PrintAllCurrentGoroutines = true
+	}
+}
+
 const (
 	AuthPrefix         = "Bearer "
 	updateInterval     = 5 * time.Second
@@ -82,9 +97,8 @@ type Headscale struct {
 
 	// Things that generate changes
 	extraRecordMan *dns.ExtraRecordsMan
-	mapper         *mapper.Mapper
-	nodeNotifier   *notifier.Notifier
 	authProvider   AuthProvider
+	mapBatcher     mapper.Batcher
 
 	pollNetMapStreamWG sync.WaitGroup
 }
@@ -118,31 +132,26 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		cfg:                cfg,
 		noisePrivateKey:    noisePrivateKey,
 		pollNetMapStreamWG: sync.WaitGroup{},
-		nodeNotifier:       notifier.NewNotifier(cfg),
 		state:              s,
 	}
 
 	// Initialize ephemeral garbage collector
 	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {
-		node, err := app.state.GetNodeByID(ni)
-		if err != nil {
-			log.Err(err).Uint64("node.id", ni.Uint64()).Msgf("failed to get ephemeral node for deletion")
+		node, ok := app.state.GetNodeByID(ni)
+		if !ok {
+			log.Error().Uint64("node.id", ni.Uint64()).Msg("Ephemeral node deletion failed")
+			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("Ephemeral node deletion failed because node not found in NodeStore")
 			return
 		}
 
 		policyChanged, err := app.state.DeleteNode(node)
 		if err != nil {
-			log.Err(err).Uint64("node.id", ni.Uint64()).Msgf("failed to delete ephemeral node")
+			log.Error().Err(err).Uint64("node.id", ni.Uint64()).Str("node.name", node.Hostname()).Msg("Ephemeral node deletion failed")
 			return
 		}
 
-		// Send policy update notifications if needed
-		if policyChanged {
-			ctx := types.NotifyCtx(context.Background(), "ephemeral-gc-policy", node.Hostname)
-			app.nodeNotifier.NotifyAll(ctx, types.UpdateFull())
-		}
-
-		log.Debug().Uint64("node.id", ni.Uint64()).Msgf("deleted ephemeral node")
+		app.Change(policyChanged)
+		log.Debug().Caller().Uint64("node.id", ni.Uint64()).Str("node.name", node.Hostname()).Msg("Ephemeral node deleted because garbage collection timeout reached")
 	})
 	app.ephemeralGC = ephemeralGC
 
@@ -153,10 +162,9 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		defer cancel()
 		oidcProvider, err := NewAuthProviderOIDC(
 			ctx,
+			&app,
 			cfg.ServerURL,
 			&cfg.OIDC,
-			app.state,
-			app.nodeNotifier,
 		)
 		if err != nil {
 			if cfg.OIDC.OnlyStartIfOIDCIsAvailable {
@@ -262,31 +270,41 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			return
 
 		case <-expireTicker.C:
-			var update types.StateUpdate
+			var expiredNodeChanges []change.ChangeSet
 			var changed bool
 
-			lastExpiryCheck, update, changed = h.state.ExpireExpiredNodes(lastExpiryCheck)
+			lastExpiryCheck, expiredNodeChanges, changed = h.state.ExpireExpiredNodes(lastExpiryCheck)
 
 			if changed {
-				log.Trace().Interface("nodes", update.ChangePatches).Msgf("expiring nodes")
+				log.Trace().Interface("changes", expiredNodeChanges).Msgf("expiring nodes")
 
-				ctx := types.NotifyCtx(context.Background(), "expire-expired", "na")
-				h.nodeNotifier.NotifyAll(ctx, update)
+				// Send the changes directly since they're already in the new format
+				for _, nodeChange := range expiredNodeChanges {
+					h.Change(nodeChange)
+				}
 			}
 
 		case <-derpTickerChan:
 			log.Info().Msg("Fetching DERPMap updates")
-			derpMap := derp.GetDERPMap(h.cfg.DERP)
-			if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
-				region, _ := h.DERPServer.GenerateRegion()
-				derpMap.Regions[region.RegionID] = &region
-			}
+			derpMap, err := backoff.Retry(ctx, func() (*tailcfg.DERPMap, error) {
+				derpMap, err := derp.GetDERPMap(h.cfg.DERP)
+				if err != nil {
+					return nil, err
+				}
+				if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
+					region, _ := h.DERPServer.GenerateRegion()
+					derpMap.Regions[region.RegionID] = &region
+				}
 
-			ctx := types.NotifyCtx(context.Background(), "derpmap-update", "na")
-			h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
-				Type:    types.StateDERPUpdated,
-				DERPMap: derpMap,
-			})
+				return derpMap, nil
+			}, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+			if err != nil {
+				log.Error().Err(err).Msg("failed to build new DERPMap, retrying later")
+				continue
+			}
+			h.state.SetDERPMap(derpMap)
+
+			h.Change(change.DERPSet)
 
 		case records, ok := <-extraRecordsUpdate:
 			if !ok {
@@ -294,19 +312,16 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			}
 			h.cfg.TailcfgDNSConfig.ExtraRecords = records
 
-			ctx := types.NotifyCtx(context.Background(), "dns-extrarecord", "all")
-			// TODO(kradalby): We can probably do better than sending a full update here,
-			// but for now this will ensure that all of the nodes get the new records.
-			h.nodeNotifier.NotifyAll(ctx, types.UpdateFull())
+			h.Change(change.ExtraRecordsSet)
 		}
 	}
 }
 
 func (h *Headscale) grpcAuthenticationInterceptor(ctx context.Context,
-	req interface{},
+	req any,
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
-) (interface{}, error) {
+) (any, error) {
 	// Check if the request is coming from the on-server client.
 	// This is not secure, but it is to maintain maintainability
 	// with the "legacy" database-based client
@@ -365,64 +380,53 @@ func (h *Headscale) httpAuthenticationMiddleware(next http.Handler) http.Handler
 		writer http.ResponseWriter,
 		req *http.Request,
 	) {
-		log.Trace().
-			Caller().
-			Str("client_address", req.RemoteAddr).
-			Msg("HTTP authentication invoked")
-
-		authHeader := req.Header.Get("authorization")
-
-		if !strings.HasPrefix(authHeader, AuthPrefix) {
-			log.Error().
+		if err := func() error {
+			log.Trace().
 				Caller().
 				Str("client_address", req.RemoteAddr).
-				Msg(`missing "Bearer " prefix in "Authorization" header`)
-			writer.WriteHeader(http.StatusUnauthorized)
-			_, err := writer.Write([]byte("Unauthorized"))
+				Msg("HTTP authentication invoked")
+
+			authHeader := req.Header.Get("Authorization")
+
+			if !strings.HasPrefix(authHeader, AuthPrefix) {
+				log.Error().
+					Caller().
+					Str("client_address", req.RemoteAddr).
+					Msg(`missing "Bearer " prefix in "Authorization" header`)
+				writer.WriteHeader(http.StatusUnauthorized)
+				_, err := writer.Write([]byte("Unauthorized"))
+				return err
+			}
+
+			valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
 			if err != nil {
 				log.Error().
 					Caller().
 					Err(err).
-					Msg("Failed to write response")
+					Str("client_address", req.RemoteAddr).
+					Msg("failed to validate token")
+
+				writer.WriteHeader(http.StatusInternalServerError)
+				_, err := writer.Write([]byte("Unauthorized"))
+				return err
 			}
 
-			return
-		}
+			if !valid {
+				log.Info().
+					Str("client_address", req.RemoteAddr).
+					Msg("invalid token")
 
-		valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
-		if err != nil {
+				writer.WriteHeader(http.StatusUnauthorized)
+				_, err := writer.Write([]byte("Unauthorized"))
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			log.Error().
 				Caller().
 				Err(err).
-				Str("client_address", req.RemoteAddr).
-				Msg("failed to validate token")
-
-			writer.WriteHeader(http.StatusInternalServerError)
-			_, err := writer.Write([]byte("Unauthorized"))
-			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
-			}
-
-			return
-		}
-
-		if !valid {
-			log.Info().
-				Str("client_address", req.RemoteAddr).
-				Msg("invalid token")
-
-			writer.WriteHeader(http.StatusUnauthorized)
-			_, err := writer.Write([]byte("Unauthorized"))
-			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
-			}
-
+				Msg("Failed to write HTTP response")
 			return
 		}
 
@@ -448,6 +452,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *mux.Router {
 	router.HandleFunc(ts2021UpgradePath, h.NoiseUpgradeHandler).
 		Methods(http.MethodPost, http.MethodGet)
 
+	router.HandleFunc("/robots.txt", h.RobotsHandler).Methods(http.MethodGet)
 	router.HandleFunc("/health", h.HealthHandler).Methods(http.MethodGet)
 	router.HandleFunc("/key", h.KeyHandler).Methods(http.MethodGet)
 	router.HandleFunc("/register/{registration_id}", h.authProvider.RegisterHandler).
@@ -484,65 +489,14 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *mux.Router {
 	return router
 }
 
-// // TODO(kradalby): Do a variant of this, and polman which only updates the node that has changed.
-// // Maybe we should attempt a new in memory state and not go via the DB?
-// // Maybe this should be implemented as an event bus?
-// // A bool is returned indicating if a full update was sent to all nodes
-// func usersChangedHook(db *db.HSDatabase, polMan policy.PolicyManager, notif *notifier.Notifier) error {
-// 	users, err := db.ListUsers()
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	changed, err := polMan.SetUsers(users)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	if changed {
-// 		ctx := types.NotifyCtx(context.Background(), "acl-users-change", "all")
-// 		notif.NotifyAll(ctx, types.UpdateFull())
-// 	}
-
-// 	return nil
-// }
-
-// // TODO(kradalby): Do a variant of this, and polman which only updates the node that has changed.
-// // Maybe we should attempt a new in memory state and not go via the DB?
-// // Maybe this should be implemented as an event bus?
-// // A bool is returned indicating if a full update was sent to all nodes
-// func nodesChangedHook(
-// 	db *db.HSDatabase,
-// 	polMan policy.PolicyManager,
-// 	notif *notifier.Notifier,
-// ) (bool, error) {
-// 	nodes, err := db.ListNodes()
-// 	if err != nil {
-// 		return false, err
-// 	}
-
-// 	filterChanged, err := polMan.SetNodes(nodes)
-// 	if err != nil {
-// 		return false, err
-// 	}
-
-// 	if filterChanged {
-// 		ctx := types.NotifyCtx(context.Background(), "acl-nodes-change", "all")
-// 		notif.NotifyAll(ctx, types.UpdateFull())
-
-// 		return true, nil
-// 	}
-
-// 	return false, nil
-// }
-
 // Serve launches the HTTP and gRPC server service Headscale and the API.
 func (h *Headscale) Serve() error {
+	var err error
 	capver.CanOldCodeBeCleanedUp()
 
 	if profilingEnabled {
 		if profilingPath != "" {
-			err := os.MkdirAll(profilingPath, os.ModePerm)
+			err = os.MkdirAll(profilingPath, os.ModePerm)
 			if err != nil {
 				log.Fatal().Err(err).Msg("failed to create profiling directory")
 			}
@@ -562,43 +516,43 @@ func (h *Headscale) Serve() error {
 		Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
 		Msg("Clients with a lower minimum version will be rejected")
 
-	// Fetch an initial DERP Map before we start serving
-	h.mapper = mapper.NewMapper(h.state, h.cfg, h.nodeNotifier)
+	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
+	h.mapBatcher.Start()
+	defer h.mapBatcher.Close()
 
-	// TODO(kradalby): fix state part.
 	if h.cfg.DERP.ServerEnabled {
 		// When embedded DERP is enabled we always need a STUN server
 		if h.cfg.DERP.STUNAddr == "" {
 			return errSTUNAddressNotSet
 		}
 
-		region, err := h.DERPServer.GenerateRegion()
-		if err != nil {
-			return fmt.Errorf("generating DERP region for embedded server: %w", err)
-		}
-
-		if h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
-			h.state.DERPMap().Regions[region.RegionID] = &region
-		}
-
 		go h.DERPServer.ServeSTUN()
 	}
 
-	if len(h.state.DERPMap().Regions) == 0 {
+	derpMap, err := derp.GetDERPMap(h.cfg.DERP)
+	if err != nil {
+		return fmt.Errorf("failed to get DERPMap: %w", err)
+	}
+
+	if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
+		region, _ := h.DERPServer.GenerateRegion()
+		derpMap.Regions[region.RegionID] = &region
+	}
+
+	if len(derpMap.Regions) == 0 {
 		return errEmptyInitialDERPMap
 	}
+
+	h.state.SetDERPMap(derpMap)
 
 	// Start ephemeral node garbage collector and schedule all nodes
 	// that are already in the database and ephemeral. If they are still
 	// around between restarts, they will reconnect and the GC will
 	// be cancelled.
 	go h.ephemeralGC.Start()
-	ephmNodes, err := h.state.ListEphemeralNodes()
-	if err != nil {
-		return fmt.Errorf("failed to list ephemeral nodes: %w", err)
-	}
-	for _, node := range ephmNodes {
-		h.ephemeralGC.Schedule(node.ID, h.cfg.EphemeralNodeInactivityTimeout)
+	ephmNodes := h.state.ListEphemeralNodes()
+	for _, node := range ephmNodes.All() {
+		h.ephemeralGC.Schedule(node.ID(), h.cfg.EphemeralNodeInactivityTimeout)
 	}
 
 	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
@@ -828,19 +782,14 @@ func (h *Headscale) Serve() error {
 					continue
 				}
 
-				changed, err := h.state.ReloadPolicy()
+				changes, err := h.state.ReloadPolicy()
 				if err != nil {
 					log.Error().Err(err).Msgf("reloading policy")
 					continue
 				}
 
-				if changed {
-					log.Info().
-						Msg("ACL policy successfully reloaded, notifying nodes of change")
+				h.Change(changes...)
 
-					ctx := types.NotifyCtx(context.Background(), "acl-sighup", "na")
-					h.nodeNotifier.NotifyAll(ctx, types.UpdateFull())
-				}
 			default:
 				info := func(msg string) { log.Info().Msg(msg) }
 				log.Info().
@@ -865,7 +814,6 @@ func (h *Headscale) Serve() error {
 				}
 
 				info("closing node notifier")
-				h.nodeNotifier.Close()
 
 				info("waiting for netmap stream to close")
 				h.pollNetMapStreamWG.Wait()
@@ -1046,4 +994,11 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 	}
 
 	return &machineKey, nil
+}
+
+// Change is used to send changes to nodes.
+// All change should be enqueued here and empty will be automatically
+// ignored.
+func (h *Headscale) Change(cs ...change.ChangeSet) {
+	h.mapBatcher.AddWork(cs...)
 }

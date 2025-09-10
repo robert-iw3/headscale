@@ -370,10 +370,12 @@ func TestSSHUserOnlyIsolation(t *testing.T) {
 }
 
 func doSSH(t *testing.T, client TailscaleClient, peer TailscaleClient) (string, string, error) {
+	t.Helper()
 	return doSSHWithRetry(t, client, peer, true)
 }
 
 func doSSHWithoutRetry(t *testing.T, client TailscaleClient, peer TailscaleClient) (string, string, error) {
+	t.Helper()
 	return doSSHWithRetry(t, client, peer, false)
 }
 
@@ -407,7 +409,7 @@ func doSSHWithRetry(t *testing.T, client TailscaleClient, peer TailscaleClient, 
 
 			// For all other errors, assert no error to trigger retry
 			assert.NoError(ct, err)
-		}, 10*time.Second, 1*time.Second)
+		}, 10*time.Second, 200*time.Millisecond)
 	} else {
 		// For failure cases, just execute once
 		result, stderr, err = client.Execute(command)

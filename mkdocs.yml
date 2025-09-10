@@ -104,7 +104,7 @@ extra:
     - icon: fontawesome/brands/discord
       link: https://discord.gg/c84AZQhmpx
   headscale:
-    version: 0.26.0
+    version: 0.26.1
 
 # Extensions
 markdown_extensions:
@@ -181,7 +181,9 @@ nav:
       - TLS: ref/tls.md
       - ACLs: ref/acls.md
       - DNS: ref/dns.md
+      - DERP: ref/derp.md
       - Remote CLI: ref/remote-cli.md
+      - Debug: ref/debug.md
       - Integration:
           - Reverse proxy: ref/integration/reverse-proxy.md
           - Web UI: ref/integration/web-ui.md

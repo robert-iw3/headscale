@@ -9,6 +9,7 @@ import (
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/samber/lo"
@@ -30,7 +31,11 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 			assertNoErr(t, err)
 			defer scenario.ShutdownAssertNoPanics(t)
 
-			opts := []hsic.Option{hsic.WithTestName("pingallbyip")}
+			opts := []hsic.Option{
+				hsic.WithTestName("pingallbyip"),
+				hsic.WithEmbeddedDERPServerOnly(),
+				hsic.WithDERPAsIP(),
+			}
 			if https {
 				opts = append(opts, []hsic.Option{
 					hsic.WithTLS(),
@@ -49,6 +54,21 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 			err = scenario.WaitForTailscaleSync()
 			assertNoErrSync(t, err)
 
+			headscale, err := scenario.Headscale()
+			assertNoErrGetHeadscale(t, err)
+
+			expectedNodes := make([]types.NodeID, 0, len(allClients))
+			for _, client := range allClients {
+				status := client.MustStatus()
+				nodeID, err := strconv.ParseUint(string(status.Self.ID), 10, 64)
+				assertNoErr(t, err)
+				expectedNodes = append(expectedNodes, types.NodeID(nodeID))
+			}
+			requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected", 30*time.Second)
+
+			// Validate that all nodes have NetInfo and DERP servers before logout
+			requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP before logout", 1*time.Minute)
+
 			// assertClientsState(t, allClients)
 
 			clientIPs := make(map[TailscaleClient][]netip.Addr)
@@ -59,9 +79,6 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 				}
 				clientIPs[client] = ips
 			}
-
-			headscale, err := scenario.Headscale()
-			assertNoErrGetHeadscale(t, err)
 
 			listNodes, err := headscale.ListNodes()
 			assert.Len(t, allClients, len(listNodes))
@@ -82,13 +99,16 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 			err = scenario.WaitForTailscaleLogout()
 			assertNoErrLogout(t, err)
 
+			// After taking down all nodes, verify all systems show nodes offline
+			requireAllClientsOnline(t, headscale, expectedNodes, false, "all nodes should have logged out", 120*time.Second)
+
 			t.Logf("all clients logged out")
 
 			assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 				var err error
 				listNodes, err = headscale.ListNodes()
 				assert.NoError(ct, err)
-				assert.Equal(ct, nodeCountBeforeLogout, len(listNodes), "Node count should match before logout count")
+				assert.Len(ct, listNodes, nodeCountBeforeLogout, "Node count should match before logout count")
 			}, 20*time.Second, 1*time.Second)
 
 			for _, node := range listNodes {
@@ -123,12 +143,20 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 				var err error
 				listNodes, err = headscale.ListNodes()
 				assert.NoError(ct, err)
-				assert.Equal(ct, nodeCountBeforeLogout, len(listNodes), "Node count should match after HTTPS reconnection")
+				assert.Len(ct, listNodes, nodeCountBeforeLogout, "Node count should match after HTTPS reconnection")
 			}, 30*time.Second, 2*time.Second)
 
 			for _, node := range listNodes {
 				assertLastSeenSet(t, node)
 			}
+
+			requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to batcher", 120*time.Second)
+
+			// Validate that all nodes have NetInfo and DERP servers after reconnection
+			requireAllClientsNetInfoAndDERP(t, headscale, expectedNodes, "all clients should have NetInfo and DERP after reconnection", 1*time.Minute)
+
+			err = scenario.WaitForTailscaleSync()
+			assertNoErrSync(t, err)
 
 			allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 				return x.String()
@@ -161,12 +189,66 @@ func TestAuthKeyLogoutAndReloginSameUser(t *testing.T) {
 			}
 
 			listNodes, err = headscale.ListNodes()
-			require.Equal(t, nodeCountBeforeLogout, len(listNodes))
+			require.Len(t, listNodes, nodeCountBeforeLogout)
 			for _, node := range listNodes {
 				assertLastSeenSet(t, node)
 			}
 		})
 	}
+}
+
+// requireAllClientsNetInfoAndDERP validates that all nodes have NetInfo in the database
+// and a valid DERP server based on the NetInfo. This function follows the pattern of
+// requireAllClientsOnline by using hsic.DebugNodeStore to get the database state.
+func requireAllClientsNetInfoAndDERP(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID, message string, timeout time.Duration) {
+	t.Helper()
+
+	startTime := time.Now()
+	t.Logf("requireAllClientsNetInfoAndDERP: Starting validation at %s - %s", startTime.Format(TimestampFormat), message)
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		// Get nodestore state
+		nodeStore, err := headscale.DebugNodeStore()
+		assert.NoError(c, err, "Failed to get nodestore debug info")
+		if err != nil {
+			return
+		}
+
+		// Validate node counts first
+		expectedCount := len(expectedNodes)
+		assert.Equal(c, expectedCount, len(nodeStore), "NodeStore total nodes mismatch")
+
+		// Check each expected node
+		for _, nodeID := range expectedNodes {
+			node, exists := nodeStore[nodeID]
+			assert.True(c, exists, "Node %d not found in nodestore", nodeID)
+			if !exists {
+				continue
+			}
+
+			// Validate that the node has Hostinfo
+			assert.NotNil(c, node.Hostinfo, "Node %d (%s) should have Hostinfo", nodeID, node.Hostname)
+			if node.Hostinfo == nil {
+				continue
+			}
+
+			// Validate that the node has NetInfo
+			assert.NotNil(c, node.Hostinfo.NetInfo, "Node %d (%s) should have NetInfo in Hostinfo", nodeID, node.Hostname)
+			if node.Hostinfo.NetInfo == nil {
+				continue
+			}
+
+			// Validate that the node has a valid DERP server (PreferredDERP should be > 0)
+			preferredDERP := node.Hostinfo.NetInfo.PreferredDERP
+			assert.Greater(c, preferredDERP, 0, "Node %d (%s) should have a valid DERP server (PreferredDERP > 0), got %d", nodeID, node.Hostname, preferredDERP)
+
+			t.Logf("Node %d (%s) has valid NetInfo with DERP server %d", nodeID, node.Hostname, preferredDERP)
+		}
+	}, timeout, 2*time.Second, message)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	t.Logf("requireAllClientsNetInfoAndDERP: Completed validation at %s - Duration: %v - %s", endTime.Format(TimestampFormat), duration, message)
 }
 
 func assertLastSeenSet(t *testing.T, node *v1.Node) {
@@ -193,6 +275,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{},
 		hsic.WithTestName("keyrelognewuser"),
 		hsic.WithTLS(),
+		hsic.WithDERPAsIP(),
 	)
 	assertNoErrHeadscaleEnv(t, err)
 
@@ -282,7 +365,10 @@ func TestAuthKeyLogoutAndReloginSameUserExpiredKey(t *testing.T) {
 			assertNoErr(t, err)
 			defer scenario.ShutdownAssertNoPanics(t)
 
-			opts := []hsic.Option{hsic.WithTestName("pingallbyip")}
+			opts := []hsic.Option{
+				hsic.WithTestName("pingallbyip"),
+				hsic.WithDERPAsIP(),
+			}
 			if https {
 				opts = append(opts, []hsic.Option{
 					hsic.WithTLS(),
@@ -355,7 +441,7 @@ func TestAuthKeyLogoutAndReloginSameUserExpiredKey(t *testing.T) {
 						"--user",
 						strconv.FormatUint(userMap[userName].GetId(), 10),
 						"expire",
-						key.Key,
+						key.GetKey(),
 					})
 				assertNoErr(t, err)
 
