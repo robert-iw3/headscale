@@ -63,6 +63,8 @@ upstream is changed.
   - **IMPORTANT: Backup your SQLite database before upgrading**
   - Introduces safer table renaming migration strategy
   - Addresses longstanding database integrity issues
+- Add flag to directly manipulate the policy in the database
+  [#2765](https://github.com/juanfont/headscale/pull/2765)
 - DERPmap update frequency default changed from 24h to 3h
   [#2741](https://github.com/juanfont/headscale/pull/2741)
 - DERPmap update mechanism has been improved with retry,
@@ -70,6 +72,8 @@ upstream is changed.
   [#2741](https://github.com/juanfont/headscale/pull/2741)
 - Add support for `autogroup:member`, `autogroup:tagged`
   [#2572](https://github.com/juanfont/headscale/pull/2572)
+- Fix bug where return routes were being removed by policy
+  [#2767](https://github.com/juanfont/headscale/pull/2767)
 - Remove policy v1 code [#2600](https://github.com/juanfont/headscale/pull/2600)
 - Refactor Debian/Ubuntu packaging and drop support for Ubuntu 20.04.
   [#2614](https://github.com/juanfont/headscale/pull/2614)
@@ -87,6 +91,10 @@ upstream is changed.
   [#2663](https://github.com/juanfont/headscale/pull/2663)
 - OIDC: Update user with claims from UserInfo _before_ comparing with allowed
   groups, email and domain [#2663](https://github.com/juanfont/headscale/pull/2663)
+- Policy will now reject invalid fields, making it easier to spot spelling errors
+  [#2764](https://github.com/juanfont/headscale/pull/2764)
+- Add FAQ entry on how to recover from an invalid policy in the database
+  [#2776](https://github.com/juanfont/headscale/pull/2776)
 
 ## 0.26.1 (2025-06-06)
 

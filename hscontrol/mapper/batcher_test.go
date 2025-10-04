@@ -1028,7 +1028,9 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 
 			// Add multiple changes rapidly to test batching
 			batcher.AddWork(change.DERPSet)
-			batcher.AddWork(change.KeyExpiry(testNodes[1].n.ID))
+			// Use a valid expiry time for testing since test nodes don't have expiry set
+			testExpiry := time.Now().Add(24 * time.Hour)
+			batcher.AddWork(change.KeyExpiry(testNodes[1].n.ID, testExpiry))
 			batcher.AddWork(change.DERPSet)
 			batcher.AddWork(change.NodeAdded(testNodes[1].n.ID))
 			batcher.AddWork(change.DERPSet)
@@ -1278,7 +1280,9 @@ func TestBatcherWorkerChannelSafety(t *testing.T) {
 
 					// Add node-specific work occasionally
 					if i%10 == 0 {
-						batcher.AddWork(change.KeyExpiry(testNode.n.ID))
+						// Use a valid expiry time for testing since test nodes don't have expiry set
+						testExpiry := time.Now().Add(24 * time.Hour)
+						batcher.AddWork(change.KeyExpiry(testNode.n.ID, testExpiry))
 					}
 
 					// Rapid removal creates race between worker and removal
@@ -1361,7 +1365,11 @@ func TestBatcherConcurrentClients(t *testing.T) {
 				go func(nodeID types.NodeID, channel chan *tailcfg.MapResponse) {
 					for {
 						select {
-						case data := <-channel:
+						case data, ok := <-channel:
+							if !ok {
+								// Channel was closed, exit gracefully
+								return
+							}
 							if valid, reason := validateUpdateContent(data); valid {
 								tracker.recordUpdate(
 									nodeID,
@@ -1419,24 +1427,28 @@ func TestBatcherConcurrentClients(t *testing.T) {
 							ch := make(chan *tailcfg.MapResponse, SMALL_BUFFER_SIZE)
 
 							churningChannelsMutex.Lock()
-
 							churningChannels[nodeID] = ch
-
 							churningChannelsMutex.Unlock()
+
 							batcher.AddNode(nodeID, ch, tailcfg.CapabilityVersion(100))
 
 							// Consume updates to prevent blocking
 							go func() {
 								for {
 									select {
-									case data := <-ch:
+									case data, ok := <-ch:
+										if !ok {
+											// Channel was closed, exit gracefully
+											return
+										}
 										if valid, _ := validateUpdateContent(data); valid {
 											tracker.recordUpdate(
 												nodeID,
 												1,
 											) // Use 1 as update size since we have MapResponse
 										}
-									case <-time.After(20 * time.Millisecond):
+									case <-time.After(500 * time.Millisecond):
+										// Longer timeout to prevent premature exit during heavy load
 										return
 									}
 								}
@@ -1485,7 +1497,9 @@ func TestBatcherConcurrentClients(t *testing.T) {
 					if i%7 == 0 && len(allNodes) > 0 {
 						// Node-specific changes using real nodes
 						node := allNodes[i%len(allNodes)]
-						batcher.AddWork(change.KeyExpiry(node.n.ID))
+						// Use a valid expiry time for testing since test nodes don't have expiry set
+						testExpiry := time.Now().Add(24 * time.Hour)
+						batcher.AddWork(change.KeyExpiry(node.n.ID, testExpiry))
 					}
 
 					// Small delay to allow some batching

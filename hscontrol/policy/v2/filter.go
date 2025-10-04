@@ -28,7 +28,7 @@ func (pol *Policy) compileFilterRules(
 	var rules []tailcfg.FilterRule
 
 	for _, acl := range pol.ACLs {
-		if acl.Action != "accept" {
+		if acl.Action != ActionAccept {
 			return nil, ErrInvalidAction
 		}
 
@@ -41,12 +41,7 @@ func (pol *Policy) compileFilterRules(
 			continue
 		}
 
-		// TODO(kradalby): integrate type into schema
-		// TODO(kradalby): figure out the _ is wildcard stuff
-		protocols, _, err := parseProtocol(acl.Protocol)
-		if err != nil {
-			return nil, fmt.Errorf("parsing policy, protocol err: %w ", err)
-		}
+		protocols, _ := acl.Protocol.parseProtocol()
 
 		var destPorts []tailcfg.NetPortRange
 		for _, dest := range acl.Destinations {
@@ -89,11 +84,12 @@ func (pol *Policy) compileFilterRules(
 
 func sshAction(accept bool, duration time.Duration) tailcfg.SSHAction {
 	return tailcfg.SSHAction{
-		Reject:                   !accept,
-		Accept:                   accept,
-		SessionDuration:          duration,
-		AllowAgentForwarding:     true,
-		AllowLocalPortForwarding: true,
+		Reject:                    !accept,
+		Accept:                    accept,
+		SessionDuration:           duration,
+		AllowAgentForwarding:      true,
+		AllowLocalPortForwarding:  true,
+		AllowRemotePortForwarding: true,
 	}
 }
 
@@ -131,9 +127,9 @@ func (pol *Policy) compileSSHPolicy(
 
 		var action tailcfg.SSHAction
 		switch rule.Action {
-		case "accept":
+		case SSHActionAccept:
 			action = sshAction(true, 0)
-		case "check":
+		case SSHActionCheck:
 			action = sshAction(true, time.Duration(rule.CheckPeriod))
 		default:
 			return nil, fmt.Errorf("parsing SSH policy, unknown action %q, index: %d: %w", rule.Action, index, err)
@@ -153,8 +149,17 @@ func (pol *Policy) compileSSHPolicy(
 		}
 
 		userMap := make(map[string]string, len(rule.Users))
-		for _, user := range rule.Users {
-			userMap[user.String()] = "="
+		if rule.Users.ContainsNonRoot() {
+			userMap["*"] = "="
+
+			// by default, we do not allow root unless explicitly stated
+			userMap["root"] = ""
+		}
+		if rule.Users.ContainsRoot() {
+			userMap["root"] = "root"
+		}
+		for _, u := range rule.Users.NormalUsers() {
+			userMap[u.String()] = u.String()
 		}
 		rules = append(rules, &tailcfg.SSHRule{
 			Principals: principals,
