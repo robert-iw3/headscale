@@ -693,6 +693,35 @@ func (s *Scenario) WaitForTailscaleSync() error {
 	return err
 }
 
+// WaitForTailscaleSyncPerUser blocks execution until each TailscaleClient has the expected
+// number of peers for its user. This is useful for policies like autogroup:self where nodes
+// only see same-user peers, not all nodes in the network.
+func (s *Scenario) WaitForTailscaleSyncPerUser(timeout, retryInterval time.Duration) error {
+	var allErrors []error
+
+	for _, user := range s.users {
+		// Calculate expected peer count: number of nodes in this user minus 1 (self)
+		expectedPeers := len(user.Clients) - 1
+
+		for _, client := range user.Clients {
+			c := client
+			expectedCount := expectedPeers
+			user.syncWaitGroup.Go(func() error {
+				return c.WaitForPeers(expectedCount, timeout, retryInterval)
+			})
+		}
+		if err := user.syncWaitGroup.Wait(); err != nil {
+			allErrors = append(allErrors, err)
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return multierr.New(allErrors...)
+	}
+
+	return nil
+}
+
 // WaitForTailscaleSyncWithPeerCount blocks execution until all the TailscaleClient reports
 // to have all other TailscaleClients present in their netmap.NetworkMap.
 func (s *Scenario) WaitForTailscaleSyncWithPeerCount(peerCount int, timeout, retryInterval time.Duration) error {
@@ -838,14 +867,14 @@ func doLoginURL(hostname string, loginURL *url.URL) (string, error) {
 
 	var err error
 	hc := &http.Client{
-		Transport: LoggingRoundTripper{},
+		Transport: LoggingRoundTripper{Hostname: hostname},
 	}
 	hc.Jar, err = cookiejar.New(nil)
 	if err != nil {
 		return "", fmt.Errorf("%s failed to create cookiejar	: %w", hostname, err)
 	}
 
-	log.Printf("%s logging in with url", hostname)
+	log.Printf("%s logging in with url: %s", hostname, loginURL.String())
 	ctx := context.Background()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), nil)
 	resp, err := hc.Do(req)
@@ -907,7 +936,9 @@ func (s *Scenario) runHeadscaleRegister(userStr string, body string) error {
 	return fmt.Errorf("failed to find headscale: %w", errNoHeadscaleAvailable)
 }
 
-type LoggingRoundTripper struct{}
+type LoggingRoundTripper struct {
+	Hostname string
+}
 
 func (t LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	noTls := &http.Transport{
@@ -918,9 +949,12 @@ func (t LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, err
 	}
 
-	log.Printf("---")
-	log.Printf("method: %s | url: %s", resp.Request.Method, resp.Request.URL.String())
-	log.Printf("status: %d | cookies: %+v", resp.StatusCode, resp.Cookies())
+	log.Printf(`
+---
+%s - method: %s | url: %s
+%s - status: %d | cookies: %+v
+---
+`, t.Hostname, req.Method, req.URL.String(), t.Hostname, resp.StatusCode, resp.Cookies())
 
 	return resp, nil
 }

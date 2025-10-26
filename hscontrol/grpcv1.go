@@ -741,7 +741,7 @@ func (api headscaleV1APIServer) DebugCreateNode(
 	hostinfo := tailcfg.Hostinfo{
 		RoutableIPs: routes,
 		OS:          "TestOS",
-		Hostname:    "DebugTestNode",
+		Hostname:    request.GetName(),
 	}
 
 	registrationId, err := types.RegistrationIDFromString(request.GetKey())
@@ -749,8 +749,8 @@ func (api headscaleV1APIServer) DebugCreateNode(
 		return nil, err
 	}
 
-	newNode := types.RegisterNode{
-		Node: types.Node{
+	newNode := types.NewRegisterNode(
+		types.Node{
 			NodeKey:    key.NewNode().Public(),
 			MachineKey: key.NewMachine().Public(),
 			Hostname:   request.GetName(),
@@ -761,8 +761,7 @@ func (api headscaleV1APIServer) DebugCreateNode(
 
 			Hostinfo: &hostinfo,
 		},
-		Registered: make(chan *types.Node),
-	}
+	)
 
 	log.Debug().
 		Caller().
@@ -772,6 +771,26 @@ func (api headscaleV1APIServer) DebugCreateNode(
 	api.h.state.SetRegistrationCacheEntry(registrationId, newNode)
 
 	return &v1.DebugCreateNodeResponse{Node: newNode.Node.Proto()}, nil
+}
+
+func (api headscaleV1APIServer) Health(
+	ctx context.Context,
+	request *v1.HealthRequest,
+) (*v1.HealthResponse, error) {
+	var healthErr error
+	response := &v1.HealthResponse{}
+
+	if err := api.h.state.PingDB(ctx); err != nil {
+		healthErr = fmt.Errorf("database ping failed: %w", err)
+	} else {
+		response.DatabaseConnectivity = true
+	}
+
+	if healthErr != nil {
+		log.Error().Err(healthErr).Msg("Health check failed")
+	}
+
+	return response, healthErr
 }
 
 func (api headscaleV1APIServer) mustEmbedUnimplementedHeadscaleServiceServer() {}
